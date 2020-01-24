@@ -1,0 +1,78 @@
+node {
+
+    def AWS_REGION = "us-east-1"
+    def APP_VERSION = "1.0"
+
+    properties([
+        parameters([
+            // Define the Jenkins project parameters, such as Amazon ECR URL, Docker images to be used, and App names
+            stringParam(name: 'ECR_URL', defaultValue: '168429521373.dkr.ecr.us-east-1.amazonaws.com', description: 'ECR Address'),
+            stringParam(name: 'APP_NAME', defaultValue: 'umsl', description: 'APP_NAME'),
+            stringParam(name: 'SONAR_URL', defaultValue: 'sonarqube:7.7-community', description: 'Sonar Docker Image'),
+            stringParam(name: 'SONAR_NAME', defaultValue: 'sonarqube', description: 'SonarQube image name'),
+            stringParam(name: 'PROM_URL', defaultValue: 'prom/prometheus:v2.10.0', description: 'prometheus Docker Image'),
+            stringParam(name: 'PROM_NAME', defaultValue: 'prometheus', description: 'prometheus image name'),
+            stringParam(name: 'GRAFANA_URL', defaultValue: 'grafana/grafana:6.2.2', description: 'grafana Docker Image'),
+            stringParam(name: 'GRAFANA_NAME', defaultValue: 'grafana', description: 'Grafana image name')
+        ])
+    ])
+
+    // Clone the repo from GitHub
+    stage('Clone repository') {
+        checkout scm
+    }
+
+    // Package the app as a war to deploy it as a container
+    stage('Package') {
+        sh("""
+            chmod a+x mvnw
+            ./mvnw -Pprod,war clean verify
+            """)
+    }
+
+    // Launch application tests
+    stage('Test') {
+        sh("""
+            chmod a+x mvnw
+            ./mvnw verify && ./mvnw clean test
+            """)
+    }
+
+    // dockerize the applications (UMSL, Sonar, Prometheus and Grafana). Then push them to Amazon ECR repo
+    stage('Build and Push to ECR') {
+        sh("""
+            chmod a+x mvnw && ./mvnw -Pprod verify jib:dockerBuild
+            docker tag umsl "${params.ECR_URL}/${params.APP_NAME}:${APP_VERSION}"
+            docker pull "${params.SONAR_URL}" && docker tag "${params.SONAR_URL}" "${params.ECR_URL}/${params.APP_NAME}:${params.SONAR_NAME}"
+            docker pull "${params.PROM_URL}" && docker tag "${params.PROM_URL}" "${params.ECR_URL}/${params.APP_NAME}:${params.PROM_NAME}"
+            docker pull "${params.GRAFANA_URL}" && docker tag "${params.GRAFANA_URL}" "${params.ECR_URL}/${params.APP_NAME}:${params.GRAFANA_NAME}"
+            """)
+        sh("eval \$(aws ecr get-login --no-include-email --region ${AWS_REGION} | sed 's|https://||')")
+        sh("""
+            docker push "${params.ECR_URL}/${params.APP_NAME}:${APP_VERSION}"
+            docker push "${params.ECR_URL}/${params.APP_NAME}:${params.SONAR_NAME}"
+            docker push "${params.ECR_URL}/${params.APP_NAME}:${params.PROM_NAME}"
+            docker push "${params.ECR_URL}/${params.APP_NAME}:${params.GRAFANA_NAME}"
+            """)
+    }
+
+    // Deploy the containers to Amazon Kubernetets EKS cluster using EKS
+    stage('Deploy to Amazon EKS') {
+            sh("""
+                aws-iam-authenticator token -i eks-umsl
+                pip3 install --upgrade awscli
+                aws eks --region us-east-1 update-kubeconfig --name eks-umsl
+                cd deployment;
+                helm upgrade --dry-run --install --force ${params.APP_NAME} ./${params.APP_NAME}
+                helm upgrade --atomic --install --force ${params.APP_NAME} ./${params.APP_NAME}
+                """)
+    }
+
+    // Analyse code quality using SonarQube
+    stage('Sonar Code Quality') {
+        sh("""
+            chmod a+x mvnw && ./mvnw -Pprod clean verify sonar:sonar
+            """)
+    }
+
+}
